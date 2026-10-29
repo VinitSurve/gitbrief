@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# gitbrief - Fast, zero-dependency Git repository situational awareness briefing
+# Specification: PROJECT_TEMPLATE.md
+
+set -euo pipefail
+
+# Default configuration
+COUNT=3
+SHORT=0
+USE_COLOR=1
+
+# Auto-detect terminal color support: disable color if stdout is not a TTY or NO_COLOR is set
+if [ ! -t 1 ] || [ -n "${NO_COLOR:-}" ]; then
+    USE_COLOR=0
+fi
+
+usage() {
+    cat << 'USAGE_EOF'
+Usage: gitbrief [options]
+
+Options:
+  -c, --count <N>   Number of recent commits to display (default: 3)
+  -s, --short       Compact mode: show only counts, omit file paths
+      --no-color    Disable ANSI color output
+  -h, --help        Show this help message and exit
+USAGE_EOF
+}
+
+# Parse command-line options
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -s|--short)
+            SHORT=1
+            shift
+            ;;
+        -c|--count)
+            if [ -z "${2:-}" ] || ! [[ "$2" =~ ^[0-9]+$ ]]; then
+                echo "gitbrief: error: option '$1' requires a valid integer argument" >&2
+                usage >&2
+                exit 2
+            fi
+            COUNT="$2"
+            shift 2
+            ;;
+        --count=*)
+            val="${1#*=}"
+            if [ -z "$val" ] || ! [[ "$val" =~ ^[0-9]+$ ]]; then
+                echo "gitbrief: error: option '--count' requires a valid integer argument" >&2
+                usage >&2
+                exit 2
+            fi
+            COUNT="$val"
+            shift
+            ;;
+        --no-color)
+            USE_COLOR=0
+            shift
+            ;;
+        *)
+            echo "gitbrief: unrecognized option '$1'" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+# Initialize ANSI color sequences
+if [ "$USE_COLOR" -eq 1 ]; then
+    COLOR_RESET="\033[0m"
+    COLOR_BOLD="\033[1m"
+    COLOR_CYAN="\033[36m"
+    COLOR_GREEN="\033[32m"
+    COLOR_YELLOW="\033[33m"
+    COLOR_RED="\033[31m"
+    COLOR_MAGENTA="\033[35m"
+    COLOR_BLUE="\033[34m"
+else
+    COLOR_RESET=""
+    COLOR_BOLD=""
+    COLOR_CYAN=""
+    COLOR_GREEN=""
+    COLOR_YELLOW=""
+    COLOR_RED=""
+    COLOR_MAGENTA=""
+    COLOR_BLUE=""
+fi
+
+# Verify Git context and discover repository root and git directory
+if ! PARSE_OUT="$(git rev-parse --is-inside-work-tree --show-toplevel --git-dir 2>/dev/null)"; then
+    echo "gitbrief: error: not a git repository (or any parent up to mount point)" >&2
+    exit 1
+fi
+
+REPO_ROOT=""
+GIT_DIR=""
+line_num=0
+while IFS= read -r line; do
+    line_num=$((line_num + 1))
+    if [ "$line_num" -eq 2 ]; then
+        REPO_ROOT="$line"
+    elif [ "$line_num" -eq 3 ]; then
+        GIT_DIR="$line"
+    fi
+done <<< "$PARSE_OUT"
+
+REPO_NAME="$(basename "$REPO_ROOT")"
+
+# Ensure GIT_DIR is absolute for reliable file presence checks
+if [[ "$GIT_DIR" != /* ]]; then
+    GIT_DIR="$REPO_ROOT/$GIT_DIR"
+fi
+
+# Determine current branch or detached HEAD state
+BRANCH="$(git -C "$REPO_ROOT" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+if [ -z "$BRANCH" ]; then
+    HEAD_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || true)"
+    if [ -n "$HEAD_SHA" ]; then
+        BRANCH="(detached at $HEAD_SHA)"
+    else
+        BRANCH="main"
+    fi
+fi
+
+# Check upstream tracking status
+TRACKING_INFO=""
+UPSTREAM="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+if [ -n "$UPSTREAM" ]; then
+    AHEAD_BEHIND="$(git -C "$REPO_ROOT" rev-list --left-right --count HEAD..."$UPSTREAM" 2>/dev/null || true)"
+    if [ -n "$AHEAD_BEHIND" ]; then
+        read -r AHEAD BEHIND <<< "$AHEAD_BEHIND"
+        AHEAD="${AHEAD:-0}"
+        BEHIND="${BEHIND:-0}"
+        if [ "$AHEAD" -gt 0 ] && [ "$BEHIND" -gt 0 ]; then
+            TRACKING_INFO=" [ahead $AHEAD, behind $BEHIND vs $UPSTREAM]"
+        elif [ "$AHEAD" -gt 0 ]; then
+            TRACKING_INFO=" [ahead $AHEAD vs $UPSTREAM]"
+        elif [ "$BEHIND" -gt 0 ]; then
+            TRACKING_INFO=" [behind $BEHIND vs $UPSTREAM]"
+        else
+            TRACKING_INFO=" [up to date with $UPSTREAM]"
+        fi
+    fi
+fi
+
+# Detect stash count
+STASH_COUNT=0
+if STASHES="$(git -C "$REPO_ROOT" stash list 2>/dev/null)"; then
+    if [ -n "$STASHES" ]; then
+        STASH_COUNT=$(printf '%s\n' "$STASHES" | grep -c -v '^$' || true)
+    fi
+fi
+
+# Detect in-progress operations
+OPERATION=""
+if [ -f "$GIT_DIR/MERGE_HEAD" ]; then
+    OPERATION="[Merge in progress]"
+elif [ -d "$GIT_DIR/rebase-merge" ] || [ -d "$GIT_DIR/rebase-apply" ]; then
+    OPERATION="[Rebase in progress]"
+elif [ -f "$GIT_DIR/CHERRY_PICK_HEAD" ]; then
+    OPERATION="[Cherry-pick in progress]"
+elif [ -f "$GIT_DIR/REVERT_HEAD" ]; then
+    OPERATION="[Revert in progress]"
+elif [ -f "$GIT_DIR/BISECT_LOG" ]; then
+    OPERATION="[Bisect in progress]"
+fi
+
+# Collect categorized working tree modifications
+STAGED_FILES="$(git -C "$REPO_ROOT" diff --cached --name-status 2>/dev/null || true)"
+UNSTAGED_FILES="$(git -C "$REPO_ROOT" diff --name-status 2>/dev/null || true)"
+UNTRACKED_FILES="$(git -C "$REPO_ROOT" ls-files --others --exclude-standard 2>/dev/null || true)"
+
+if [ -n "$STAGED_FILES" ]; then
+    STAGED_COUNT=$(printf '%s\n' "$STAGED_FILES" | grep -c -v '^$' || true)
+else
+    STAGED_COUNT=0
+fi
+
+if [ -n "$UNSTAGED_FILES" ]; then
+    UNSTAGED_COUNT=$(printf '%s\n' "$UNSTAGED_FILES" | grep -c -v '^$' || true)
+else
+    UNSTAGED_COUNT=0
+fi
+
+if [ -n "$UNTRACKED_FILES" ]; then
+    UNTRACKED_COUNT=$(printf '%s\n' "$UNTRACKED_FILES" | grep -c -v '^$' || true)
+else
+    UNTRACKED_COUNT=0
+fi
+
+# Render Header
+printf '%bRepository:%b %s (%b%s%b)\n' "$COLOR_BOLD$COLOR_CYAN" "$COLOR_RESET" "$REPO_NAME" "$COLOR_BLUE" "$REPO_ROOT" "$COLOR_RESET"
+printf '%bBranch:%b     %b%s%b%s\n' "$COLOR_BOLD$COLOR_CYAN" "$COLOR_RESET" "$COLOR_MAGENTA" "$BRANCH" "$COLOR_RESET" "$TRACKING_INFO"
+if [ "$STASH_COUNT" -gt 0 ]; then
+    printf '%bStashes:%b    %s stashed state(s)\n' "$COLOR_BOLD$COLOR_CYAN" "$COLOR_RESET" "$STASH_COUNT"
+fi
+if [ -n "$OPERATION" ]; then
+    printf '%bOperation:%b  %b%s%b\n' "$COLOR_BOLD$COLOR_CYAN" "$COLOR_RESET" "$COLOR_RED" "$OPERATION" "$COLOR_RESET"
+fi
+printf '\n'
+
+# Render Working Tree Status
+printf '%bWorking Tree Status:%b\n' "$COLOR_BOLD" "$COLOR_RESET"
+printf '  %bStaged changes:%b   %s\n' "$COLOR_GREEN" "$COLOR_RESET" "$STAGED_COUNT"
+if [ "$SHORT" -eq 0 ] && [ "$STAGED_COUNT" -gt 0 ]; then
+    while IFS=$'\t' read -r status file1 file2; do
+        [ -z "$status" ] && continue
+        if [ -n "$file2" ]; then
+            st_char="${status:0:1}"
+            file_display="$file1 -> $file2"
+        else
+            st_char="$status"
+            file_display="$file1"
+        fi
+        printf '    %b+%b [%s] %s\n' "$COLOR_GREEN" "$COLOR_RESET" "$st_char" "$file_display"
+    done <<< "$STAGED_FILES"
+fi
+
+printf '  %bUnstaged changes:%b %s\n' "$COLOR_YELLOW" "$COLOR_RESET" "$UNSTAGED_COUNT"
+if [ "$SHORT" -eq 0 ] && [ "$UNSTAGED_COUNT" -gt 0 ]; then
+    while IFS=$'\t' read -r status file1 file2; do
+        [ -z "$status" ] && continue
+        if [ -n "$file2" ]; then
+            st_char="${status:0:1}"
+            file_display="$file1 -> $file2"
+        else
+            st_char="$status"
+            file_display="$file1"
+        fi
+        printf '    %b*%b [%s] %s\n' "$COLOR_YELLOW" "$COLOR_RESET" "$st_char" "$file_display"
+    done <<< "$UNSTAGED_FILES"
+fi
+
+printf '  %bUntracked files:%b  %s\n' "$COLOR_RED" "$COLOR_RESET" "$UNTRACKED_COUNT"
+if [ "$SHORT" -eq 0 ] && [ "$UNTRACKED_COUNT" -gt 0 ]; then
+    while IFS= read -r file; do
+        [ -z "$file" ] && continue
+        printf '    %b?%b %s\n' "$COLOR_RED" "$COLOR_RESET" "$file"
+    done <<< "$UNTRACKED_FILES"
+fi
+printf '\n'
+
+# Render Recent Commits
+printf '%bRecent Commits (last %s):%b\n' "$COLOR_BOLD" "$COUNT" "$COLOR_RESET"
+if git -C "$REPO_ROOT" rev-parse --verify HEAD >/dev/null 2>&1; then
+    if [ "$COUNT" -gt 0 ]; then
+        if [ "$USE_COLOR" -eq 1 ]; then
+            git -C "$REPO_ROOT" log -n "$COUNT" --pretty=format:"  %C(yellow)%h%Creset %C(green)(%cr)%Creset %s %C(blue)<%an>%Creset" 2>/dev/null
+        else
+            git -C "$REPO_ROOT" log -n "$COUNT" --pretty=format:"  %h (%cr) %s <%an>" 2>/dev/null
+        fi
+        printf '\n'
+    fi
+else
+    printf '  (No commits yet - fresh repository)\n'
+fi
+
